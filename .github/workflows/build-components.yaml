@@ -1177,3 +1177,4 @@ jobs:
             chmod 644 /opt/anet/download/*
             echo "Beta artifacts permissions updated successfully."
 
+
