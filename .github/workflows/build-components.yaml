@@ -1,1 +1,1180 @@
+name: "Build Components"
+
+on:
+  workflow_call:
+    secrets:
+      MACOS_CERTIFICATE:
+        required: false
+      MACOS_CERTIFICATE_PASSWORD:
+        required: false
+      KEYCHAIN_PASSWORD:
+        required: false
+      APPLE_ID:
+        required: false
+      APPLE_ID_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      SSH_HOST:
+        required: false
+      SSH_USER:
+        required: false
+      SSH_KEY:
+        required: false
+      SSH_PORT:
+        required: false
+    outputs:
+      server-artifact:
+        value: ${{ jobs.build-linux-server.outputs.artifact }}
+      linux-client-artifact:
+        value: ${{ jobs.build-linux-client.outputs.artifact }}
+      windows-client-artifact:
+        value: ${{ jobs.build-windows-client.outputs.artifact }}
+      macos-client-artifact:
+        value: ${{ jobs.build-macos-client.outputs.artifact }}
+
+jobs:
+  test:
+    name: "Run Unit Tests"
+    runs-on: "ubuntu-24.04"
+    steps:
+      - uses: "actions/checkout@v4"
+
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+
+      - name: "Install dependencies"
+        run: |
+          if ! command -v protoc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 || ! command -v clang >/dev/null 2>&1; then
+            sudo mkdir -p /etc/systemd/resolved.conf.d
+            printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+            sudo systemctl restart systemd-resolved || true
+            for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+              IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+              [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+              [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+            done
+            APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+            sudo apt-get $APT_OPTS update
+            sudo apt-get $APT_OPTS install -y protobuf-compiler cmake clang
+          else
+            echo "protoc, cmake, and clang are already installed."
+          fi
+
+      - name: "Install Rust Stable"
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: "Install Rust Nightly (for anet-ebpf)"
+        run: |
+          rustup toolchain install nightly --component rust-src
+
+      - name: "Install bpf-linker"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tests-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-tests-
+            ${{ runner.os }}-cargo-server-full-
+
+      - name: "Run Workspace Unit Tests"
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          cargo test --package anet-common --package anet-filter-core --package anet-client-core --package anet-client-cli --package anet-server --package anet-auth --package anet-keygen --package anet-ebpf-common
+
+  build-linux-server:
+    name: "Build Linux Server & Tools"
+    runs-on: "ubuntu-24.04"
+    needs: "test"
+    steps:
+      - uses: "actions/checkout@v4"
+
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+      - name: "Install dependencies"
+        run: |
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+          sudo systemctl restart systemd-resolved || true
+          for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+            IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+          done
+          APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y musl-tools protobuf-compiler gcc-aarch64-linux-gnu mingw-w64 cmake clang
+
+      - name: "Install Rust Stable"
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, x86_64-pc-windows-gnu
+
+      # 1. Ставим nightly с rust-src для компиляции anet-ebpf
+      - name: "Install Rust Nightly (for anet-ebpf)"
+        run: |
+          rustup toolchain install nightly --component rust-src
+
+      # 2. Скачиваем готовый статический бинарник bpf-linker (за 1 секунду вместо 5 минут сборки)
+      - name: "Install bpf-linker"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-server-full-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-server-full-
+
+      # 1. Сборка Linux бинарников со встроенным eBPF (Static MUSL)
+      - name: "Build Linux Binaries (Musl)"
+        env:
+          CXX_x86_64_unknown_linux_musl: g++
+          CXXFLAGS_x86_64_unknown_linux_musl: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
+          BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl: c
+          MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=-Wl,-u,fopen,-u,strtoull,-u,strtol,-u,strtoul,-u,abort,-u,free -C link-arg=-Wl,--defsym=fopen64=fopen -C link-arg=-Wl,--defsym=__isoc23_strtoull=strtoull -C link-arg=-Wl,--defsym=__isoc23_strtol=strtol -C link-arg=-Wl,--defsym=__isoc23_strtoul=strtoul -C link-arg=-Wl,--defsym=__cxa_pure_virtual=abort -C link-arg=-Wl,--defsym=_ZdlPv=free -C link-arg=-Wl,--defsym=_ZdlPvm=free -C link-arg=-Wl,--defsym=_ZSt24__throw_out_of_range_fmtPKcz=abort -C link-arg=-Wl,--defsym=_ZSt20__throw_length_errorPKc=abort -C link-arg=-Wl,--defsym=_ZSt17__throw_bad_allocv=abort -C link-arg=-Wl,--defsym=_ZSt28__throw_bad_array_new_lengthv=abort"
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          RUSTFLAGS="$MUSL_RUSTFLAGS" cargo build --release --package anet-server --target x86_64-unknown-linux-musl
+          RUSTFLAGS="$MUSL_RUSTFLAGS" cargo build --release --package anet-auth --target x86_64-unknown-linux-musl
+          RUSTFLAGS="$MUSL_RUSTFLAGS" cargo build --release --package anet-keygen --target x86_64-unknown-linux-musl
+
+      # 2. Сборка Windows Keygen (Cross-compile)
+      - name: "Build Windows Keygen"
+        run: |
+          cargo build --release --package anet-keygen --target x86_64-pc-windows-gnu
+
+      # 3. Подготовка папки для артефакта
+      - name: "Prepare Artifact Folder"
+        run: |
+          mkdir -p server_bin
+          
+          # Linux
+          cp target/x86_64-unknown-linux-musl/release/anet-server server_bin/
+          cp target/x86_64-unknown-linux-musl/release/anet-auth server_bin/
+          cp target/x86_64-unknown-linux-musl/release/anet-keygen server_bin/
+          
+          # Windows
+          cp target/x86_64-pc-windows-gnu/release/anet-keygen.exe server_bin/
+
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "anet-server-full"
+          path: "server_bin/"
+
+  build-linux-client:
+    name: "Build Linux Client (AMD64 & ARM64)"
+    runs-on: "ubuntu-24.04"
+    needs: "test"
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+      - name: "Install dependencies"
+        run: |
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+          sudo systemctl restart systemd-resolved || true
+          for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+            IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+          done
+          APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y musl-tools protobuf-compiler cmake clang
+
+      - name: "Install Rust"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          override: "true"
+
+      - name: "Add Rust Targets"
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+
+      # ARM64 содержит C-зависимости (aws-lc, ring и zstd). Для musl им нужен
+      # настоящий musl cross-toolchain, а не glibc linker aarch64-linux-gnu-gcc.
+      - name: "Install cross"
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-linux-client-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-linux-client-
+
+      # Сборка AMD64 (x86_64)
+      - name: "Build Client (AMD64)"
+        env:
+          CXX_x86_64_unknown_linux_musl: g++
+          CXXFLAGS_x86_64_unknown_linux_musl: "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
+          BORING_BSSL_RUST_CPPLIB_x86_64_unknown_linux_musl: c
+          MUSL_RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=-Wl,-u,fopen,-u,strtoull,-u,strtol,-u,strtoul,-u,abort,-u,free -C link-arg=-Wl,--defsym=fopen64=fopen -C link-arg=-Wl,--defsym=__isoc23_strtoull=strtoull -C link-arg=-Wl,--defsym=__isoc23_strtol=strtol -C link-arg=-Wl,--defsym=__isoc23_strtoul=strtoul -C link-arg=-Wl,--defsym=__cxa_pure_virtual=abort -C link-arg=-Wl,--defsym=_ZdlPv=free -C link-arg=-Wl,--defsym=_ZdlPvm=free -C link-arg=-Wl,--defsym=_ZSt24__throw_out_of_range_fmtPKcz=abort -C link-arg=-Wl,--defsym=_ZSt20__throw_length_errorPKc=abort -C link-arg=-Wl,--defsym=_ZSt17__throw_bad_allocv=abort -C link-arg=-Wl,--defsym=_ZSt28__throw_bad_array_new_lengthv=abort"
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          RUSTFLAGS="$MUSL_RUSTFLAGS" cargo build --release --package anet-client-cli --target x86_64-unknown-linux-musl
+
+      # Сборка ARM64 (aarch64) в готовом musl cross-окружении.
+      - name: "Build Client (ARM64)"
+        env:
+          CI: "true"
+          BORING_BSSL_RUST_CPPLIB_aarch64_unknown_linux_musl: "c"
+          CXXFLAGS_aarch64_unknown_linux_musl: "-fno-exceptions -fno-rtti -fno-sized-deallocation -DBORINGSSL_TEMPORARY_NO_CXX_RUNTIME"
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          cross build --release --package anet-client-cli --target aarch64-unknown-linux-musl
+
+      # Загрузка артефакта AMD64
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-client-linux-amd64"
+          path: "target/x86_64-unknown-linux-musl/release/anet-client"
+
+      # Загрузка артефакта ARM64
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-client-linux-arm64"
+          path: "target/aarch64-unknown-linux-musl/release/anet-client"
+
+  build-windows-client:
+    name: "Build Windows Client"
+    runs-on: "windows-latest"
+    needs: "test"
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+      - name: "Install Build Tools (Windows)"
+        run: "choco install protoc cmake nasm -y"
+
+      - name: "Install Rust"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          override: "true"
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Per-app split tunneling (anet-appfilter/windivert) требует на этапе
+      # линковки WinDivert.lib/.dll/.sys — по аналогии с wintun.dll ниже, но
+      # эти файлы нужны уже сейчас, для сборки, а не только для установщика.
+      - name: "Download WinDivert SDK (for per-app build)"
+        shell: pwsh
+        run: |
+          $WINDIVERT_VERSION = "2.2.2"
+          Invoke-WebRequest -Uri "https://github.com/basil00/WinDivert/releases/download/v$WINDIVERT_VERSION/WinDivert-$WINDIVERT_VERSION-A.zip" -OutFile "windivert.zip"
+          Expand-Archive -Path "windivert.zip" -DestinationPath "windivert_sdk_raw" -Force
+
+          New-Item -ItemType Directory -Force -Path "windivert_sdk" | Out-Null
+          $dll = Get-ChildItem -Path "windivert_sdk_raw" -Recurse -Filter "WinDivert.dll" | Where-Object { $_.DirectoryName -like "*x64*" } | Select-Object -First 1
+          $lib = Get-ChildItem -Path "windivert_sdk_raw" -Recurse -Filter "WinDivert.lib" | Where-Object { $_.DirectoryName -like "*x64*" } | Select-Object -First 1
+          $sys = Get-ChildItem -Path "windivert_sdk_raw" -Recurse -Filter "WinDivert64.sys" | Select-Object -First 1
+
+          Copy-Item $dll.FullName "windivert_sdk\WinDivert.dll"
+          Copy-Item $lib.FullName "windivert_sdk\WinDivert.lib"
+          Copy-Item $sys.FullName "windivert_sdk\WinDivert64.sys"
+
+          $sdkPath = (Resolve-Path "windivert_sdk").Path
+          echo "WINDIVERT_PATH=$sdkPath" >> $env:GITHUB_ENV
+
+          Remove-Item "windivert_sdk_raw", "windivert.zip" -Recurse -Force
+
+      - name: "Build Client (CLI) (Windows)"
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          cargo build --release --package anet-client-cli --features per-app
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-client-windows-cli"
+          path: "target/release/anet-client.exe"
+
+      - name: "Build Client (GUI) (Windows)"
+        run: "cargo build --release --package anet-client-gui --features per-app"
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-client-windows-gui"
+          path: "target/release/anet-gui.exe"
+
+      - name: "Build Client (GUI - Debug Console) (Windows)"
+        run: "cargo build --release --package anet-client-gui --features console,per-app"
+
+      - name: "Remove existing debug build if exists"
+        run: "if (Test-Path target/release/anet-gui-debug.exe) { Remove-Item target/release/anet-gui-debug.exe }"
+
+      - name: "Rename Debug Build"
+        run: "mv target/release/anet-gui.exe target/release/anet-gui-debug.exe"
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-gui-debug"
+          path: "target/release/anet-gui-debug.exe"
+
+  build-macos-client:
+    name: "Build macOS Client (Universal)"
+    runs-on: "macos-latest"
+    needs: "test"
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+
+      # На macOS-latest protobuf обычно есть, но для гарантии ставим вместе с cmake
+      - name: "Install Dependencies"
+        run: brew install protobuf cmake
+
+      - name: "Install Rust Targets (Apple Silicon & Intel)"
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-universal-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-universal-
+            ${{ runner.os }}-cargo-
+
+      # Сборка CLI (Intel + ARM)
+      - name: "Build CLI (x86_64)"
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          cargo build --release --package anet-client-cli --target x86_64-apple-darwin
+
+      - name: "Build CLI (aarch64)"
+        run: cargo build --release --package anet-client-cli --target aarch64-apple-darwin
+
+      # Сборка GUI (Intel + ARM)
+      - name: "Build GUI (x86_64)"
+        run: cargo build --release --package anet-client-gui --target x86_64-apple-darwin
+
+      - name: "Build GUI (aarch64)"
+        run: cargo build --release --package anet-client-gui --target aarch64-apple-darwin
+
+      # Создание Universal Binaries с помощью lipo
+      - name: "Create Universal Binaries"
+        run: |
+          mkdir -p target/universal-release
+          
+          # CLI
+          lipo -create -output target/universal-release/anet-client \
+            target/x86_64-apple-darwin/release/anet-client \
+            target/aarch64-apple-darwin/release/anet-client
+          
+          # GUI
+          lipo -create -output target/universal-release/anet-gui \
+            target/x86_64-apple-darwin/release/anet-gui \
+            target/aarch64-apple-darwin/release/anet-gui
+          
+          echo "Universal binaries created."
+          file target/universal-release/anet-client
+          file target/universal-release/anet-gui
+
+      # Упаковка в .app бандл
+      - name: "Package macOS App Bundle"
+        run: |
+          APP_NAME="ANet VPN"
+          APP_DIR="target/universal-release/$APP_NAME.app"
+          CONTENTS="$APP_DIR/Contents"
+          MACOS="$CONTENTS/MacOS"
+          RESOURCES="$CONTENTS/Resources"
+          
+          mkdir -p "$MACOS"
+          mkdir -p "$RESOURCES"
+          
+          # Копируем Universal GUI бинарник
+          cp "target/universal-release/anet-gui" "$MACOS/anet-gui"
+          chmod +x "$MACOS/anet-gui"
+          
+          # Копируем Info.plist
+          cp "anet-client-gui/macos/Info.plist" "$CONTENTS/Info.plist"
+          
+          # Создаем PkgInfo
+          echo -n "APPL????" > "$CONTENTS/PkgInfo"
+
+          # Копируем иконку
+          cp "anet-client-gui/macos/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+
+          echo "App bundle created at $APP_DIR"
+
+      - name: "Check Certificate Availability"
+        id: check_cert
+        env:
+          # Безопасно передаем секрет в env, не используя его в if
+          CERT: ${{ secrets.MACOS_CERTIFICATE }}
+        run: |
+          if [ -n "$CERT" ]; then
+            echo "has_cert=true" >> $GITHUB_OUTPUT
+            echo "Certificate detected."
+          else
+            echo "has_cert=false" >> $GITHUB_OUTPUT
+            echo "Certificate NOT detected."
+          fi
+
+      - name: "Import Code Signing Certificate"
+        # Используем output предыдущего шага вместо прямого доступа к secrets
+        if: steps.check_cert.outputs.has_cert == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          
+          # Import certificate
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          
+          rm certificate.p12
+
+      - name: "Sign App Bundle with Entitlements"
+        # Используем output предыдущего шага
+        if: steps.check_cert.outputs.has_cert == 'true'
+        run: |
+          # Find the Developer ID certificate identity
+          IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}')
+          
+          echo "Signing with identity: $IDENTITY"
+          
+          # Sign the app bundle
+          codesign --force --deep --sign "$IDENTITY" \
+            --entitlements "anet-client-gui/macos/entitlements.plist" \
+            --options runtime \
+            "target/universal-release/ANet VPN.app"
+          
+          # Sign the CLI binary
+          codesign --force --sign "$IDENTITY" \
+            --entitlements "anet-client-gui/macos/entitlements.plist" \
+            --options runtime \
+            "target/universal-release/anet-client"
+          
+          echo "Binaries signed with Developer ID"
+
+      - name: "Check Notarization Credentials"
+        id: check_notarize
+        if: steps.check_cert.outputs.has_cert == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            echo "can_notarize=true" >> $GITHUB_OUTPUT
+            echo "Notarization credentials detected."
+          else
+            echo "can_notarize=false" >> $GITHUB_OUTPUT
+            echo "Notarization credentials NOT detected, skipping notarization."
+          fi
+
+      - name: "Notarize App Bundle"
+        if: steps.check_notarize.outputs.can_notarize == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Create a zip for notarization
+          ditto -c -k --keepParent "target/universal-release/ANet VPN.app" "target/universal-release/ANet_VPN_notarize.zip"
+
+          # Submit for notarization
+          echo "Submitting app for notarization..."
+          xcrun notarytool submit "target/universal-release/ANet_VPN_notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # Staple the notarization ticket to the app
+          echo "Stapling notarization ticket..."
+          xcrun stapler staple "target/universal-release/ANet VPN.app"
+
+          # Clean up
+          rm "target/universal-release/ANet_VPN_notarize.zip"
+
+          echo "App notarized and stapled successfully"
+
+      - name: "Notarize CLI Binary"
+        if: steps.check_notarize.outputs.can_notarize == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Create a zip for CLI notarization (notarytool requires zip/dmg/pkg)
+          ditto -c -k "target/universal-release/anet-client" "target/universal-release/anet-client-notarize.zip"
+
+          # Submit for notarization
+          echo "Submitting CLI for notarization..."
+          xcrun notarytool submit "target/universal-release/anet-client-notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # Note: Cannot staple standalone binaries, only .app, .pkg, .dmg
+          # Clean up
+          rm "target/universal-release/anet-client-notarize.zip"
+
+          echo "CLI notarized successfully"
+
+      - name: "Ad-hoc Sign (fallback for PRs without certificate)"
+        # Используем output предыдущего шага (инверсия)
+        if: steps.check_cert.outputs.has_cert != 'true'
+        run: |
+          echo "No certificate available, using ad-hoc signing"
+          echo "Note: Ad-hoc signed binaries require sudo for TUN device access"
+          
+          # Sign the app bundle
+          codesign --force --deep --sign - \
+            --entitlements "anet-client-gui/macos/entitlements.plist" \
+            "target/universal-release/ANet VPN.app"
+          
+          # Sign the CLI binary
+          codesign --force --sign - \
+            --entitlements "anet-client-gui/macos/entitlements.plist" \
+            "target/universal-release/anet-client"
+          
+          echo "Binaries signed with ad-hoc signature"
+
+      # Загружаем CLI отдельно (для тех, кто хочет через терминал)
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-client-macos-cli"
+          path: "target/universal-release/anet-client"
+
+      # Загружаем .app (внутри zip, т.к. actions могут ломать права в папках)
+      - name: "Zip App Bundle"
+        run: |
+          cd target/universal-release
+          # Remove any extended attributes before zipping
+          xattr -cr "ANet VPN.app"
+          # Use ditto to preserve code signature and resource forks
+          ditto -c -k --keepParent --sequesterRsrc "ANet VPN.app" "ANet_VPN_macOS.app.zip"
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-client-macos-app"
+          path: "target/universal-release/ANet_VPN_macOS.app.zip"
+
+  create-installer:
+    name: "Create Windows Installer"
+    runs-on: "windows-latest"
+    needs: "build-windows-client"
+    steps:
+      - name: "Checkout repository"
+        uses: "actions/checkout@v6"
+
+      - name: "Download Client Artifact (CLI)"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-client-windows-cli"
+          path: "installer_source/"
+
+      - name: "Download Client Artifact (GUI)"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-client-windows-gui"
+          path: "installer_source/"
+
+      - name: "Download Client Artifact (GUI Debug)"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-gui-debug"
+          path: "installer_source/"
+
+      - name: "List files in installer_source for debugging"
+        shell: "powershell"
+        run: |
+          Write-Host "Listing files in installer_source:"
+          Get-ChildItem -Path "installer_source" -Recurse | Format-Table Name, FullName
+
+      - name: "Install Inno Setup"
+        shell: "powershell"
+        run: "choco install -y innosetup"
+
+      - name: "Prepare Source Files"
+        shell: "powershell"
+        run: |
+          # Сначала проверим, какие файлы есть на самом деле
+          Write-Host "Files in installer_source directory:"
+          Get-ChildItem "installer_source"
+          
+          # Файлы уже находятся в installer_source/ напрямую (без подпапок)
+          # Проверим, что они существуют перед копированием других файлов
+          
+          # Скачивание и размещение Wintun DLL
+          $WINTUN_VERSION="0.14.1"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$WINTUN_VERSION.zip" -OutFile "installer_source\wintun.zip"
+          Expand-Archive -Path "installer_source\wintun.zip" -DestinationPath "installer_source\wintun"
+          Copy-Item -Path "installer_source\wintun\wintun\bin\amd64\wintun.dll" -Destination "installer_source\wintun.dll" -Force
+          Remove-Item "installer_source\wintun", "installer_source\wintun.zip" -Recurse -Force
+
+          # Скачивание и размещение WinDivert (per-app split tunneling, anet-appfilter)
+          $WINDIVERT_VERSION="2.2.2"
+          Invoke-WebRequest -Uri "https://github.com/basil00/WinDivert/releases/download/v$WINDIVERT_VERSION/WinDivert-$WINDIVERT_VERSION-A.zip" -OutFile "installer_source\windivert.zip"
+          Expand-Archive -Path "installer_source\windivert.zip" -DestinationPath "installer_source\windivert_raw" -Force
+          $wdDll = Get-ChildItem -Path "installer_source\windivert_raw" -Recurse -Filter "WinDivert.dll" | Where-Object { $_.DirectoryName -like "*x64*" } | Select-Object -First 1
+          $wdSys = Get-ChildItem -Path "installer_source\windivert_raw" -Recurse -Filter "WinDivert64.sys" | Select-Object -First 1
+          Copy-Item -Path $wdDll.FullName -Destination "installer_source\WinDivert.dll" -Force
+          Copy-Item -Path $wdSys.FullName -Destination "installer_source\WinDivert64.sys" -Force
+          Remove-Item "installer_source\windivert_raw", "installer_source\windivert.zip" -Recurse -Force
+          
+          # Копирование config и ISS скрипта в рабочую директорию
+          Copy-Item -Path "contrib\config\client.toml" -Destination "installer_source\client.toml" -Force
+          
+          # Для запуска ISCC скрипт должен быть в рабочем каталоге
+          Copy-Item -Path "contrib\inno_setup\install.iss" -Destination "installer_source\install.iss" -Force
+          
+          # Иконка
+          Copy-Item -Path "contrib\inno_setup\anet.ico" -Destination "installer_source\anet.ico" -Force
+          
+          # Проверка итоговых файлов
+          Write-Host "Final files in installer_source:"
+          Get-ChildItem "installer_source"
+          $required = @("anet-client.exe", "anet-gui.exe", "anet-gui-debug.exe", "wintun.dll", "WinDivert.dll", "WinDivert64.sys", "client.toml", "install.iss", "anet.ico")
+          foreach ($file in $required) {
+            if (-not (Test-Path "installer_source\$file")) {
+              throw "Required installer file is missing: $file"
+            }
+          }
+
+      - name: Set Release Version (for ISCC Define)
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            # Для тегов: убираем 'v' в начале
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            # Для веток: берем только последнюю часть после '/'
+            VERSION=${GITHUB_REF##*/}
+          fi
+          # Очищаем версию от недопустимых символов
+          CLEAN_VERSION=$(echo "$VERSION" | sed 's/[\/\\:*?"<>|]/-/g')
+          echo "VERSION_ARG=/DMyAppVersion=$CLEAN_VERSION" >> $GITHUB_ENV
+          echo "Clean version set to: $CLEAN_VERSION"
+
+      - name: "Compile Inno Setup Installer (using ISCC.exe)"
+        shell: "cmd"
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "%GITHUB_WORKSPACE%\installer_source\install.iss" /O"%GITHUB_WORKSPACE%\installer_source\Output" ${{ env.VERSION_ARG }}
+
+      - name: "Upload Installer Artifact"
+        uses: "actions/upload-artifact@v6"
+        with:
+          path: installer_source\Output\*.exe
+          name: anet-client-setup-windows
+          if-no-files-found: error
+
+  build-android-libs:
+    name: "Build Rust for Android"
+    runs-on: "ubuntu-24.04"
+    needs: "test"
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+
+      - name: "Install dependencies"
+        run: |
+          if ! command -v protoc >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 || ! command -v clang >/dev/null 2>&1; then
+            sudo mkdir -p /etc/systemd/resolved.conf.d
+            printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+            sudo systemctl restart systemd-resolved || true
+            for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+              IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+              [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+              [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+            done
+            APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+            sudo apt-get $APT_OPTS update
+            sudo apt-get $APT_OPTS install -y protobuf-compiler cmake clang
+          else
+            echo "protoc, cmake, and clang are already installed."
+          fi
+
+      # Установка Android NDK и Rust таргетов
+      - name: "Setup Android NDK"
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: "Install Rust Targets"
+        run: |
+          rustup target add aarch64-linux-android
+          rustup target add armv7-linux-androideabi
+          rustup target add x86_64-linux-android
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-android-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-android-
+            ${{ runner.os }}-cargo-
+
+      - name: "Install cargo-ndk"
+        run: "cargo install cargo-ndk"
+
+      - name: "Build .so libs"
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          cargo ndk -t aarch64-linux-android -t armv7-linux-androideabi -t x86_64-linux-android -o ./jniLibs build --release -p anet-mobile
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-mobile-libs"
+          path: "jniLibs/"
+
+  package-android-apk:
+    name: "Package Android APK"
+    runs-on: "ubuntu-24.04"
+    needs: "build-android-libs"
+    steps:
+      - name: "Checkout Android UI Repo"
+        uses: actions/checkout@v6
+        with:
+          repository: "ZeroTworu/anet-android"
+          path: "android-ui"
+
+      - name: "Download Rust Libs"
+        uses: actions/download-artifact@v7
+        with:
+          name: "anet-mobile-libs"
+          path: "android-ui/app/src/main/jniLibs"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: "Cache Gradle"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ВАЖНО: релизный keystore не хранится в репозитории anet-android —
+      # он приходит из секрета этого репозитория (anet) и распаковывается
+      # прямо перед сборкой. Это заменяет старую схему, где release
+      # подписывался debug-keystore, генерируемым заново на каждом свежем
+      # раннере — из-за этого каждый релиз получал новый случайный
+      # сертификат, и апдейт поверх старой версии у пользователей падал с
+      # "Приложение не установлено".
+      - name: "Restore release keystore"
+        run: |
+          mkdir -p android-ui/app/keystore
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android-ui/app/keystore/anet-release.jks
+
+      - name: "Build APK"
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd android-ui
+          chmod +x gradlew
+          # Собираем release, а не debug — см. комментарий у шага восстановления
+          # keystore выше.
+          ./gradlew assembleRelease
+
+      - uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-android-apk"
+          path: "android-ui/app/build/outputs/apk/release/app-release.apk"
+  build-push-webui-docker:
+    name: "Build & Push WebUI to GHCR"
+    runs-on: "ubuntu-24.04"
+    needs: "test"
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Log in to GitHub Container Registry"
+        uses: "docker/login-action@v3"
+        with:
+          registry: "ghcr.io"
+          username: "${{ github.actor }}"
+          password: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: "Extract metadata for Docker"
+        id: meta
+        uses: "docker/metadata-action@v5"
+        with:
+          images: "ghcr.io/${{ github.repository_owner }}/anet-webui"
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: "Build and push WebUI Docker image"
+        uses: "docker/build-push-action@v5"
+        with:
+          context: "."
+          file: "./contrib/docker/Dockerfile.webui"
+          push: true
+          tags: "${{ steps.meta.outputs.tags }}"
+          labels: "${{ steps.meta.outputs.labels }}"
+
+  build-push-auth-docker:
+    name: "Build & Push Auth Backend to GHCR"
+    runs-on: "ubuntu-24.04"
+    needs: "test"
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Log in to GitHub Container Registry"
+        uses: "docker/login-action@v3"
+        with:
+          registry: "ghcr.io"
+          username: "${{ github.actor }}"
+          password: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: "Extract metadata for Docker"
+        id: meta
+        uses: "docker/metadata-action@v5"
+        with:
+          images: "ghcr.io/${{ github.repository_owner }}/anet-auth"
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: "Build and push Auth Backend Docker image"
+        uses: "docker/build-push-action@v5"
+        with:
+          context: "."
+          file: "./contrib/docker/Dockerfile.auth"
+          push: true
+          tags: "${{ steps.meta.outputs.tags }}"
+          labels: "${{ steps.meta.outputs.labels }}"
+  build-linux-gui:
+    name: "Build Linux GUI Client (Amd64)"
+    runs-on: "ubuntu-24.04"
+    needs: "test"
+    steps:
+      - uses: "actions/checkout@v6"
+
+      - name: "Install Go (Required for BoringSSL)"
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.20'
+
+      - name: "Install dependencies"
+        run: |
+          sudo mkdir -p /etc/systemd/resolved.conf.d
+          printf "[Resolve]\nDNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4\nDNSSEC=no\n" | sudo tee /etc/systemd/resolved.conf.d/99-public-dns.conf >/dev/null
+          sudo systemctl restart systemd-resolved || true
+          for host in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+            IP=$(curl -fsSL --max-time 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -z "$IP" ] && IP=$(curl -fsSL --max-time 5 "https://dns.google/resolve?name=${host}&type=A" | jq -r '.Answer[]? | select(.type==1) | .data' | head -n1 || true)
+            [ -n "$IP" ] && echo "$IP $host" | sudo tee -a /etc/hosts >/dev/null
+          done
+          APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y libgtk-3-dev libappindicator3-dev protobuf-compiler libxdo-dev cmake clang
+
+      - name: "Install Rust"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          override: "true"
+
+      - name: "Cache Rust dependencies"
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-linux-gui-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-linux-gui-
+
+      - name: "Build GUI Client"
+        run: |
+          cargo update -p rtc-turn -p reqwest-boring
+          cargo build --release --package anet-client-gui
+
+      - name: "Upload raw binary"
+        uses: "actions/upload-artifact@v6"
+        with:
+          name: "anet-client-linux-gui-binary"
+          path: "target/release/anet-gui"
+
+#  build-arch-pkg:
+#    name: "Build Arch Linux .zst Package"
+#    runs-on: "ubuntu-latest"
+#    needs: "build-linux-gui"
+#    outputs:
+#      artifact: "anet-client-linux-gui-zst"
+#    steps:
+#      - uses: "actions/checkout@v6"
+#
+#      - name: "Download GUI Binary"
+#        uses: "actions/download-artifact@v7"
+#        with:
+#          name: "anet-client-linux-gui-binary"
+#          path: "pkg_build/"
+#
+#      - name: "Build .zst Package in Arch Container"
+#        run: |
+#          mkdir -p pkg_build
+#          cp anet-client-gui/macos/AppIcon.iconset/icon_256x256.png pkg_build/icon_256x256.png
+#
+#          # Создаем файл ярлыка
+#          cat << 'EOF' > pkg_build/anet-gui.desktop
+#          [Desktop Entry]
+#          Type=Application
+#          Name=ANet VPN
+#          Comment=Приватный VPN клиент ANet
+#          Exec=/usr/bin/anet-gui
+#          Icon=anet-gui
+#          Terminal=false
+#          StartupWMClass=anet-gui
+#          Categories=Network;VPN;
+#          EOF
+#
+#          # Создаем хук установки (автоматически выдаст setcap при установке у пользователя!)
+#          cat << 'EOF' > pkg_build/anet-vpn-gui.install
+#          post_install() {
+#              setcap cap_net_admin+ep /usr/bin/anet-gui
+#              update-desktop-database -q
+#          }
+#          post_upgrade() {
+#              post_install
+#          }
+#          post_remove() {
+#              update-desktop-database -q
+#          }
+#          EOF
+#
+#          # Создаем сборочный сценарий PKGBUILD
+#          cat << 'EOF' > pkg_build/PKGBUILD
+#          pkgname=anet-vpn-gui
+#          pkgver=${{ github.ref_name }}
+#          pkgver=${pkgver#v} # убираем 'v' в начале
+#          pkgrel=1
+#          pkgdesc="ANet VPN GUI client"
+#          arch=('x86_64')
+#          url="https://github.com/ZeroTworu/anet"
+#          license=('MIT')
+#          depends=('gtk3' 'libappindicator-gtk3' 'libayatana-appindicator' 'xdotool')
+#          source=("anet-gui" "anet-gui.desktop" "icon_256x256.png")
+#          sha256sums=('SKIP' 'SKIP' 'SKIP')
+#          install=anet-vpn-gui.install
+#
+#          package() {
+#              install -Dm755 "$srcdir/anet-gui" "$pkgdir/usr/bin/anet-gui"
+#              install -Dm644 "$srcdir/anet-gui.desktop" "$pkgdir/usr/share/applications/anet-gui.desktop"
+#              install -Dm644 "$srcdir/icon_256x256.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/anet-gui.png"
+#          }
+#          EOF
+#
+#          # ТРЕБОВАНИЕ: Добавлена предустановка системных зависимостей (gtk3, libappindicator-gtk3, libayatana-appindicator)
+#          # прямо в команду инициализации контейнера перед сборкой
+#          docker run --rm \
+#            -v "$PWD/pkg_build:/pkg" \
+#            archlinux:latest \
+#            /bin/bash -c "
+#              pacman -Syu --noconfirm --needed base-devel gtk3 libappindicator-gtk3 libayatana-appindicator xdotool
+#              useradd -m builder
+#              chown -R builder:builder /pkg
+#              cd /pkg
+#              su builder -c 'makepkg -f'
+#            "
+#
+#      - name: "Upload .zst Package"
+#        uses: "actions/upload-artifact@v6"
+#        with:
+#          name: "anet-client-linux-gui-zst"
+#          path: "pkg_build/*.pkg.tar.zst"
+
+  deploy-beta-artifacts:
+    name: "Deploy Beta Artifacts to Server"
+    runs-on: "ubuntu-24.04"
+    if: github.ref == 'refs/heads/master'
+    needs: [build-windows-client, create-installer, package-android-apk]
+    steps:
+      - uses: "actions/checkout@v4"
+
+      - name: "Download Windows CLI Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-client-windows-cli"
+          path: "artifacts/windows-cli"
+
+      - name: "Download Windows GUI Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-client-windows-gui"
+          path: "artifacts/windows-gui"
+
+      - name: "Download Windows GUI Debug Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-gui-debug"
+          path: "artifacts/windows-gui-debug"
+
+      - name: "Download Windows Installer Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-client-setup-windows"
+          path: "artifacts/windows-installer"
+
+      - name: "Download Android APK Artifact"
+        uses: "actions/download-artifact@v7"
+        with:
+          name: "anet-android-apk"
+          path: "artifacts/android-apk"
+
+      - name: "Prepare Beta Artifacts"
+        run: |
+          mkdir -p beta_upload
+          mkdir -p client_win_bundle
+
+          # 1. Бинарники для Windows
+          cp artifacts/windows-cli/anet-client.exe beta_upload/
+          cp artifacts/windows-gui/anet-gui.exe beta_upload/
+          cp artifacts/windows-gui-debug/anet-gui-debug.exe beta_upload/
+
+          # 2. Windows Setup Installer
+          INSTALLER_SRC=$(find artifacts/windows-installer -name '*.exe' | head -n 1)
+          if [ -n "$INSTALLER_SRC" ]; then
+            cp "$INSTALLER_SRC" beta_upload/ANET_VPN_Client_Setup_beta_x64.exe
+          else
+            echo "::warning::Windows installer executable not found!"
+          fi
+
+          # 3. Android APK
+          APK_SRC=$(find artifacts/android-apk -name '*.apk' | head -n 1)
+          if [ -n "$APK_SRC" ]; then
+            cp "$APK_SRC" beta_upload/anet-android-beta.apk
+          else
+            echo "::warning::Android APK file not found!"
+          fi
+
+          # 4. Формирование архива client-windows_beta.zip
+          cp artifacts/windows-cli/anet-client.exe client_win_bundle/
+          cp artifacts/windows-gui/anet-gui.exe client_win_bundle/
+          cp artifacts/windows-gui-debug/anet-gui-debug.exe client_win_bundle/
+          cp contrib/config/client.toml client_win_bundle/
+
+          # Скачиваем Wintun DLL для zip-бандла
+          cd client_win_bundle
+          curl -sLO "https://www.wintun.net/builds/wintun-0.14.1.zip"
+          unzip -q "wintun-0.14.1.zip"
+          cp "wintun/bin/amd64/wintun.dll" .
+          rm -rf "wintun" "wintun-0.14.1.zip"
+
+          # Скачиваем WinDivert для zip-бандла
+          WINDIVERT_VERSION="2.2.2"
+          curl -sLO "https://github.com/basil00/WinDivert/releases/download/v${WINDIVERT_VERSION}/WinDivert-${WINDIVERT_VERSION}-A.zip"
+          unzip -q "WinDivert-${WINDIVERT_VERSION}-A.zip" -d windivert_raw
+          cp "$(find windivert_raw -path '*x64/WinDivert.dll' | head -n1)" .
+          cp "$(find windivert_raw -path '*x64/WinDivert64.sys' | head -n1)" .
+          rm -rf windivert_raw "WinDivert-${WINDIVERT_VERSION}-A.zip"
+
+          # Упаковываем в zip
+          zip -r ../beta_upload/client-windows_beta.zip .
+          cd ..
+
+          echo "Files prepared for upload:"
+          ls -la beta_upload/
+
+      - name: "Upload Beta Artifacts via SCP"
+        uses: "appleboy/scp-action@v0.1.7"
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "beta_upload/*"
+          target: "/opt/anet/download"
+          strip_components: 1
+          overwrite: true
+          debug: true
+
+      - name: "Set permissions for Nginx"
+        uses: "appleboy/ssh-action@v1.0.3"
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            mkdir -p /opt/anet/download
+            chmod 755 /opt/anet/download
+            chmod 644 /opt/anet/download/*
+            echo "Beta artifacts permissions updated successfully."
+
 
