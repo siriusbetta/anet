@@ -186,8 +186,6 @@ jobs:
     needs: "test"
     steps:
       - uses: "actions/checkout@v6"
-        with:
-          fetch-depth: 0
 
       - name: "Install Go (Required for BoringSSL)"
         uses: actions/setup-go@v5
@@ -273,8 +271,6 @@ jobs:
     needs: "test"
     steps:
       - uses: "actions/checkout@v6"
-        with:
-          fetch-depth: 0
 
       - name: "Install Go (Required for BoringSSL)"
         uses: actions/setup-go@v5
@@ -362,8 +358,6 @@ jobs:
     needs: "test"
     steps:
       - uses: "actions/checkout@v6"
-        with:
-          fetch-depth: 0
 
       - name: "Install Go (Required for BoringSSL)"
         uses: actions/setup-go@v5
@@ -730,8 +724,6 @@ jobs:
     needs: "test"
     steps:
       - uses: "actions/checkout@v6"
-        with:
-          fetch-depth: 0
 
       - name: "Install Go (Required for BoringSSL)"
         uses: actions/setup-go@v5
@@ -801,12 +793,6 @@ jobs:
     runs-on: "ubuntu-24.04"
     needs: "build-android-libs"
     steps:
-      - name: "Checkout Main Repo (for Git version & commit count)"
-        uses: actions/checkout@v6
-        with:
-          path: "anet-main"
-          fetch-depth: 0
-
       - name: "Checkout Android UI Repo"
         uses: actions/checkout@v6
         with:
@@ -852,21 +838,11 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          GIT_VER=$(git -C anet-main describe --tags --always 2>/dev/null || echo "0.0.0-dev")
-          CLEAN_VER="${GIT_VER#v}"
-          COMMIT_COUNT=$(git -C anet-main rev-list --count HEAD 2>/dev/null || echo "${GITHUB_RUN_NUMBER:-1}")
-          echo "Injecting Android APK versionName=${CLEAN_VER} versionCode=${COMMIT_COUNT}"
-          for gf in android-ui/app/build.gradle android-ui/app/build.gradle.kts; do
-            if [ -f "$gf" ]; then
-              sed -i -E "s/versionCode[[:space:]]*=*[[:space:]]*[0-9]+/versionCode = ${COMMIT_COUNT}/g" "$gf"
-              sed -i -E "s/versionName[[:space:]]*=*[[:space:]]*\"[^\"]+\"/versionName = \"${CLEAN_VER}\"/g" "$gf"
-            fi
-          done
           cd android-ui
           chmod +x gradlew
           # Собираем release, а не debug — см. комментарий у шага восстановления
           # keystore выше.
-          ./gradlew assembleRelease -PversionName="${CLEAN_VER}" -PversionCode="${COMMIT_COUNT}"
+          ./gradlew assembleRelease
 
       - uses: "actions/upload-artifact@v6"
         with:
@@ -947,8 +923,6 @@ jobs:
     needs: "test"
     steps:
       - uses: "actions/checkout@v6"
-        with:
-          fetch-depth: 0
 
       - name: "Install Go (Required for BoringSSL)"
         uses: actions/setup-go@v5
@@ -1202,4 +1176,5 @@ jobs:
             chmod 755 /opt/anet/download
             chmod 644 /opt/anet/download/*
             echo "Beta artifacts permissions updated successfully."
+
 
