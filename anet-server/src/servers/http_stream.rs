@@ -657,12 +657,20 @@ async fn handle_http_connection(
                         }
                     };
 
+                    let mut forwarded_up = 0usize;
                     for packet in to_forward {
                         let packet_len = packet.len();
                         if tun_tx.send(packet).await.is_err() {
                             return Err(anyhow::anyhow!("Server TUN channel closed"));
                         }
                         registry.record_rx(&client_info, packet_len, "ahttp");
+                        forwarded_up += 1;
+                    }
+                    if forwarded_up > 0 {
+                        warn!(
+                            "[DIAG] uplink session={} forwarded_pkts={}",
+                            session_id, forwarded_up
+                        );
                     }
 
                     // 2. Отдача Downlink-трафика
@@ -770,6 +778,14 @@ async fn handle_http_connection(
                     }
 
                     if !raw_downlink_packets.is_empty() {
+                        warn!(
+                            "[DIAG] downlink session={} pkts={} raw_bytes={} uplink_len={} empty_poll={}",
+                            session_id,
+                            raw_downlink_packets.len(),
+                            raw_bytes_accum,
+                            uplink_len,
+                            is_empty_poll
+                        );
                         body_buf.reserve(
                             raw_bytes_accum
                                 + raw_downlink_packets.len() * (padding_step as usize + 32),
