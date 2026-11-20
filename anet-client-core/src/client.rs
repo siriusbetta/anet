@@ -1438,7 +1438,7 @@ impl AnetClient {
                 let elapsed_tx = Duration::from_micros(now_us.saturating_sub(last_tx_us));
 
                 if is_initial_phase {
-                    if elapsed_rx > Duration::from_secs(12)
+                    if elapsed_rx > Duration::from_secs(45)
                         && (elapsed_tx < Duration::from_secs(5) || has_probes)
                     {
                         warn!(
@@ -1457,14 +1457,14 @@ impl AnetClient {
                         monitor_reconnect.notify_one();
                         break;
                     }
-                    if last_rx_us > 0 || now_us >= 12_000_000 {
+                    if last_rx_us > 0 || now_us >= 45_000_000 {
                         is_initial_phase = false;
                     }
                 } else {
                     // Поскольку tx_probe отправляет ICMP Echo Request каждые 2 секунды (или идёт пользовательский TX),
                     // отсутствие любого RX дольше 15 секунд означает отвал NAT/сессии ("чёрную дыру").
                     if (elapsed_tx < Duration::from_secs(6) || has_probes)
-                        && elapsed_rx > Duration::from_secs(15)
+                        && elapsed_rx > Duration::from_secs(30)
                     {
                         stalled_counter += 1;
                         if stalled_counter == 1 {
