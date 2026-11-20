@@ -21,6 +21,73 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch, Mutex, Notify, Semaphore};
 
+static NEXT_TRAFFIC_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+// Process-local IDs deliberately contain no session identifiers or packet data.
+struct TrafficTrace {
+    id: u64,
+    started: Instant,
+    stage: &'static str,
+    enabled: bool,
+}
+
+impl TrafficTrace {
+    fn new(attempt: u32, uplink_bytes: usize) -> Self {
+        let trace = Self {
+            id: NEXT_TRAFFIC_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            started: Instant::now(),
+            stage: "waiting_headers",
+            enabled: log::log_enabled!(log::Level::Debug),
+        };
+        debug!(
+            "[AHTTP DIAG] req={} attempt={} stage=send uplink_bytes={}",
+            trace.id, attempt, uplink_bytes
+        );
+        trace
+    }
+}
+
+impl Drop for TrafficTrace {
+    fn drop(&mut self) {
+        debug!(
+            "[AHTTP DIAG] req={} stage=end last_stage={} elapsed_ms={}",
+            self.id, self.stage, self.started.elapsed().as_millis()
+        );
+    }
+}
+
+async fn read_traffic_body(
+    mut response: reqwest::Response,
+    trace: &mut TrafficTrace,
+) -> reqwest::Result<Bytes> {
+    trace.stage = "reading_body";
+    if !trace.enabled {
+        return response.bytes().await;
+    }
+    let mut body = BytesMut::new();
+    let mut chunks = 0usize;
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.is_empty() {
+            continue;
+        }
+        chunks += 1;
+        if chunks == 1 {
+            trace.stage = "body_started";
+            debug!(
+                "[AHTTP DIAG] req={} stage=first_body_chunk elapsed_ms={} bytes={}",
+                trace.id, trace.started.elapsed().as_millis(), chunk.len()
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    trace.stage = "body_complete";
+    debug!(
+        "[AHTTP DIAG] req={} stage=body_complete elapsed_ms={} bytes={} chunks={}",
+        trace.id, trace.started.elapsed().as_millis(), body.len(), chunks
+    );
+    Ok(body.freeze())
+}
+
 struct AHttpAuthChannel {
     client: Client,
     base_url: String,
@@ -1031,13 +1098,29 @@ impl ClientTransport for AHttpTransport {
                                 req.body(reqwest::Body::from(payload.clone()))
                             };
 
+                            let mut trace = TrafficTrace::new(attempt + 1, payload.len());
                             let res = req.send().await;
+                            if let Ok(ref resp) = res {
+                                trace.stage = "headers_received";
+                                debug!(
+                                    "[AHTTP DIAG] req={} stage=headers elapsed_ms={} status={} version={:?} content_length={:?}",
+                                    trace.id, trace.started.elapsed().as_millis(),
+                                    resp.status().as_u16(), resp.version(), resp.content_length()
+                                );
+                            } else {
+                                trace.stage = "request_error";
+                            }
 
                             match res {
                                 Ok(resp) if resp.status().is_success() => {
-                                    match tokio::time::timeout(body_read_timeout, resp.bytes()).await
+                                    match tokio::time::timeout(
+                                        body_read_timeout,
+                                        read_traffic_body(resp, &mut trace),
+                                    )
+                                    .await
                                     {
                                         Ok(Ok(body)) => {
+                                            trace.stage = "body_complete";
                                             got_http_ok = true;
                                             success = true;
                                             if !body.is_empty() {
@@ -1049,18 +1132,36 @@ impl ClientTransport for AHttpTransport {
                                                 let mut cursor = std::io::Cursor::new(body);
                                                 let mut unpacked_batch = Vec::with_capacity(64);
 
-                                                while let Ok(Some(encrypted_packet)) =
-                                                    read_next_packet(&mut cursor).await
-                                                {
-                                                    if let Ok((seq, decrypted)) =
-                                                        unwrap_packet_with_seq(
-                                                            &cur_state.cipher,
-                                                            &encrypted_packet,
-                                                        )
-                                                    {
-                                                        unpacked_batch.push((seq, decrypted));
+                                                loop {
+                                                    match read_next_packet(&mut cursor).await {
+                                                        Ok(Some(encrypted_packet)) => {
+                                                            match unwrap_packet_with_seq(
+                                                                &cur_state.cipher,
+                                                                &encrypted_packet,
+                                                            ) {
+                                                                Ok(packet) => unpacked_batch.push(packet),
+                                                                Err(e) => debug!(
+                                                                    "[AHTTP DIAG] req={} stage=decrypt_error error={}",
+                                                                    trace.id, e
+                                                                ),
+                                                            }
+                                                        }
+                                                        Ok(None) => break,
+                                                        Err(e) => {
+                                                            debug!(
+                                                                "[AHTTP DIAG] req={} stage=frame_error offset={} error={}",
+                                                                trace.id, cursor.position(), e
+                                                            );
+                                                            break;
+                                                        }
                                                     }
                                                 }
+
+                                                debug!(
+                                                    "[AHTTP DIAG] req={} stage=decoded elapsed_ms={} valid_packets={}",
+                                                    trace.id, trace.started.elapsed().as_millis(), unpacked_batch.len()
+                                                );
+                                                trace.stage = "decoded";
 
                                                 let rx_pkts_count = unpacked_batch.len();
                                                 rx_pkts_total = rx_pkts_count;
@@ -1082,6 +1183,10 @@ impl ClientTransport for AHttpTransport {
                                         }
                                         Ok(Err(e)) => {
                                             debug!(
+                                                "[AHTTP DIAG] req={} stage=body_error last_stage={} elapsed_ms={} timeout={} decode={}",
+                                                trace.id, trace.stage, trace.started.elapsed().as_millis(), e.is_timeout(), e.is_decode()
+                                            );
+                                            debug!(
                                                 "[AHTTP Client] Response body read error (attempt {}/{}): {}",
                                                 attempt + 1,
                                                 max_attempts,
@@ -1089,6 +1194,10 @@ impl ClientTransport for AHttpTransport {
                                             );
                                         }
                                         Err(_) => {
+                                            debug!(
+                                                "[AHTTP DIAG] req={} stage=body_timeout last_stage={} elapsed_ms={}",
+                                                trace.id, trace.stage, trace.started.elapsed().as_millis()
+                                            );
                                             debug!(
                                                 "[AHTTP Client] Response body read timed out (attempt {}/{})",
                                                 attempt + 1,
@@ -1125,6 +1234,10 @@ impl ClientTransport for AHttpTransport {
                                     }
                                 }
                                 Err(e) => {
+                                    debug!(
+                                        "[AHTTP DIAG] req={} stage=request_error elapsed_ms={} timeout={} connect={}",
+                                        trace.id, trace.started.elapsed().as_millis(), e.is_timeout(), e.is_connect()
+                                    );
                                     debug!(
                                         "[AHTTP Client] Request failed (attempt {}/{}): {}",
                                         attempt + 1,
