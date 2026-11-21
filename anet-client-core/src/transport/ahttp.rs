@@ -610,7 +610,12 @@ impl ClientTransport for AHttpTransport {
 
         let cookie_jar = Arc::new(reqwest::cookie::Jar::default());
         let build_http_client = || -> Result<Client> {
-            let mut builder = profile.build_reqwest_builder(cookie_jar.clone())?;
+            let force_http1 = self.config.ahttp.force_http1.unwrap_or(false);
+            let mut builder = if force_http1 {
+                profile.build_reqwest_builder_http1(cookie_jar.clone())?
+            } else {
+                profile.build_reqwest_builder(cookie_jar.clone())?
+            };
             builder = builder
                 .resolve(&target_host, resolved_addr)
                 .pool_max_idle_per_host(self.config.ahttp.pool_max_idle_per_host.max(2))

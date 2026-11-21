@@ -1,5 +1,5 @@
 use crate::boring_tls::{
-    build_ssl_connector_with_config, connect_ws_tls_with_config, get_browser_profile_override,
+    build_ssl_connector_with_config, build_ws_ssl_connector_with_config, connect_ws_tls_with_config, get_browser_profile_override,
     get_default_tls_config, TlsClientConfig, TlsFingerprint,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Request};
@@ -509,6 +509,30 @@ impl BrowserProfile {
                 self.tls_config.tls_frag.max_delay_ms,
             );
         }
+        Ok(builder)
+    }
+
+    /// Вариант `build_reqwest_builder` строго для HTTP/1.1 (ALPN `http/1.1`, без h2).
+    pub fn build_reqwest_builder_http1(
+        &self,
+        cookie_jar: Arc<reqwest::cookie::Jar>,
+    ) -> anyhow::Result<reqwest::ClientBuilder> {
+        let ssl_builder = build_ws_ssl_connector_with_config(&self.tls_config)?;
+        let verify_hostname = self.tls_config.verify_peer
+            && self
+                .tls_config
+                .pin_sha256
+                .as_ref()
+                .is_none_or(|p| p.trim().is_empty());
+        let builder = reqwest::Client::builder()
+            .use_preconfigured_tls(ssl_builder)
+            .tls_danger_accept_invalid_certs(!self.tls_config.verify_peer)
+            .tls_danger_accept_invalid_hostnames(!verify_hostname)
+            .user_agent(&self.user_agent)
+            .cookie_provider(cookie_jar)
+            .http1_only()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .tcp_nodelay(true);
         Ok(builder)
     }
 
