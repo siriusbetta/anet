@@ -269,6 +269,7 @@ async fn run_pool_socket(
                 incoming = ws_stream.next() => {
                     match incoming {
                         Some(Ok(Message::Binary(data))) => {
+                            debug!("[WS DIAG] srv recv {} bytes", data.len());
                             let mut offset = 0usize;
                             let mut unpacked = Vec::with_capacity(32);
                             while offset + 2 <= data.len() {
@@ -481,6 +482,7 @@ async fn run_pool_socket(
 
             if !batch_buf.is_empty() {
                 let out_bytes = batch_buf.split().freeze();
+                debug!("[WS DIAG] srv send {} bytes", out_bytes.len());
                 batch_buf.reserve(budget + 2048);
                 if send_ws_with_timeout(&mut ws_sink, Message::Binary(out_bytes), write_timeout)
                     .await

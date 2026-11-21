@@ -67,6 +67,7 @@ static WS_COOKIE_JAR: LazyLock<StdMutex<HashMap<String, HashMap<String, String>>
 impl AuthChannel for WebSocketAuthChannel {
     async fn send(&self, data: Bytes, _frag: &FragmentConfig) -> Result<()> {
         let mut socket = self.socket.lock().await;
+        debug!("[WS DIAG] auth send {} bytes", data.len());
         send_ws_with_timeout(&mut *socket, Message::Binary(data), self.write_timeout).await?;
         Ok(())
     }
@@ -77,7 +78,10 @@ impl AuthChannel for WebSocketAuthChannel {
             let mut socket = self.socket.lock().await;
             loop {
                 match socket.next().await {
-                    Some(Ok(Message::Binary(data))) => return Ok(data),
+                    Some(Ok(Message::Binary(data))) => {
+                        debug!("[WS DIAG] auth recv {} bytes", data.len());
+                        return Ok(data);
+                    }
                     Some(Ok(Message::Ping(data))) => {
                         send_ws_with_timeout(&mut *socket, Message::Pong(data), write_timeout)
                             .await?;
@@ -534,6 +538,7 @@ async fn run_client_socket(
                 incoming = ws_stream.next() => {
                     match incoming {
                         Some(Ok(Message::Binary(data))) => {
+                            debug!("[WS DIAG] data recv {} bytes", data.len());
                             let mut offset = 0usize;
                             let mut unpacked = Vec::with_capacity(32);
                             while offset + 2 <= data.len() {
